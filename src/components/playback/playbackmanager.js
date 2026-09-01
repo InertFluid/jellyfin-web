@@ -715,6 +715,10 @@ export class PlaybackManager {
         let currentTargetInfo;
         let currentPairingId = null;
 
+        // Incremented whenever "what plays next" changes; async gapless next-track
+        // resolution checks it to discard stale results
+        let gaplessGeneration = 0;
+
         this._playNextAfterEnded = true;
         const playerStates = {};
 
@@ -2345,6 +2349,9 @@ export class PlaybackManager {
         }
 
         function playInternal(item, playOptions, onPlaybackStartedFn, prevSource) {
+            // A new playback intent supersedes any pending gapless next-track resolution
+            invalidateGaplessNext(self._currentPlayer);
+
             if (item.IsPlaceHolder) {
                 loading.hide();
                 showPlaybackInfoErrorMessage(self, 'PlaybackErrorPlaceHolder');
@@ -3057,6 +3064,8 @@ export class PlaybackManager {
                 return self.setCurrentPlaylistItem(self._playQueueManager.getPlaylist()[0].PlaylistItemId, player);
             }
 
+            refreshGaplessNext(player);
+
             return Promise.resolve();
         };
 
@@ -3078,6 +3087,8 @@ export class PlaybackManager {
                     newIndex: moveResult.newIndex
                 }
             ]);
+
+            refreshGaplessNext(player);
         };
 
         self.getCurrentPlaylistIndex = function (player) {
@@ -3238,6 +3249,7 @@ export class PlaybackManager {
                 self._playQueueManager.queue(items);
             }
             Events.trigger(player, 'playlistitemadd');
+            refreshGaplessNext(player);
         }
 
         function onPlayerProgressInterval() {
@@ -3298,6 +3310,13 @@ export class PlaybackManager {
             streamInfo.started = true;
 
             startPlaybackProgressTimer(player);
+
+            // The player's own 'gaplessqueuenext' can fire before _currentPlayer
+            // is set (first play), where onGaplessQueueNext drops it. Re-resolve
+            // here; duplicate resolutions are deduped by the engine.
+            if (supportsGaplessQueue(player) && player._gaplessActive) {
+                resolveGaplessNext(player);
+            }
         }
 
         function onPlaybackStartedFromSelfManagingPlayer(e, item, mediaSource) {
@@ -3437,6 +3456,9 @@ export class PlaybackManager {
             if (getPlayerData(player).isChangingStream) {
                 return;
             }
+
+            // Playback is stopping; discard any in-flight gapless next-track resolution
+            gaplessGeneration++;
 
             stopPlaybackProgressTimer(player);
 
@@ -3596,6 +3618,153 @@ export class PlaybackManager {
             Events.off(player, 'stopped', onPlaybackStopped);
         }
 
+        function supportsGaplessQueue(player) {
+            return !!player && typeof player.setNextGaplessTrack === 'function';
+        }
+
+        function invalidateGaplessNext(player) {
+            gaplessGeneration++;
+
+            if (supportsGaplessQueue(player) && typeof player.invalidateGaplessNext === 'function') {
+                player.invalidateGaplessNext();
+            }
+        }
+
+        function resolveGaplessNext(player) {
+            if (!supportsGaplessQueue(player)) {
+                return;
+            }
+
+            const generation = gaplessGeneration;
+            const nextItemInfo = self._playQueueManager.getNextItemInfo();
+
+            // Only resolve items that are gapless-eligible on their face; the plugin performs the
+            // deep eligibility checks and falls back to the stock 'ended' flow when it cannot use them
+            if (!nextItemInfo || nextItemInfo.item.MediaType !== MediaType.Audio || !isServerItem(nextItemInfo.item)) {
+                player.setNextGaplessTrack(null, null, null);
+                return;
+            }
+
+            const nextItem = nextItemInfo.item;
+
+            self.getPlaybackInfo(nextItem, { startPositionTicks: 0 }).then(function (streamInfo) {
+                if (generation !== gaplessGeneration) {
+                    return;
+                }
+
+                player.setNextGaplessTrack(streamInfo, nextItem, nextItem.PlaylistItemId);
+            }).catch(function () {
+                if (generation === gaplessGeneration) {
+                    player.setNextGaplessTrack(null, null, null);
+                }
+            });
+        }
+
+        function refreshGaplessNext(player) {
+            player = player || self._currentPlayer;
+
+            invalidateGaplessNext(player);
+
+            if (player === self._currentPlayer && supportsGaplessQueue(player) && getPlayerData(player).streamInfo) {
+                resolveGaplessNext(player);
+            }
+        }
+
+        self._refreshGaplessNext = refreshGaplessNext;
+
+        function onGaplessQueueNext() {
+            const player = this;
+
+            if (player !== self._currentPlayer) {
+                return;
+            }
+
+            resolveGaplessNext(player);
+        }
+
+        function onGaplessTrackBoundary(e, info) {
+            const player = this;
+            const itemInfo = info?.itemInfo;
+            const newStreamInfo = itemInfo?.streamInfo;
+
+            if (!itemInfo?.item || !newStreamInfo) {
+                return;
+            }
+
+            console.debug('gapless track boundary reached');
+
+            stopPlaybackProgressTimer(player);
+
+            const playerData = getPlayerData(player);
+            const prevStreamInfo = info.prevItemInfo?.streamInfo || playerData.streamInfo;
+
+            // Report the previous track as stopped at its full duration, without touching the player
+            if (prevStreamInfo && isServerItem(prevStreamInfo.item)) {
+                const stopState = self.getPlayerState(player, prevStreamInfo.item, prevStreamInfo.mediaSource);
+                const runTimeTicks = prevStreamInfo.item.RunTimeTicks || prevStreamInfo.mediaSource?.RunTimeTicks;
+
+                if (stopState.PlayState && runTimeTicks) {
+                    stopState.PlayState.PositionTicks = runTimeTicks;
+                }
+
+                stopState.NextMediaType = itemInfo.item.MediaType;
+                stopState.NextItem = itemInfo.item;
+
+                // only used internally as a safeguard to avoid reporting other events to the server after playback stopped
+                prevStreamInfo.ended = true;
+
+                reportPlayback(self, stopState, player, true, prevStreamInfo.item.ServerId, 'reportPlaybackStopped');
+
+                Events.trigger(player, 'playbackstop', [stopState]);
+                Events.trigger(self, 'playbackstop', [{
+                    player: player,
+                    state: stopState,
+                    nextItem: itemInfo.item,
+                    nextMediaType: itemInfo.item.MediaType
+                }]);
+            }
+
+            // Update the queue position without going through playInternal
+            const queueItem = self.getItemFromPlaylistItemId(itemInfo.playlistItemId);
+
+            if (queueItem.Item) {
+                setPlaylistState(itemInfo.playlistItemId, queueItem.Index);
+            }
+
+            // Same bookkeeping as onPlaybackStarted, minus starting the player
+            playerData.streamInfo = newStreamInfo;
+            newStreamInfo.playbackStartTimeTicks = new Date().getTime() * 10000;
+
+            const mediaSource = newStreamInfo.mediaSource;
+
+            if (mediaSource) {
+                playerData.audioStreamIndex = mediaSource.DefaultAudioStreamIndex;
+                playerData.subtitleStreamIndex = mediaSource.DefaultSubtitleStreamIndex;
+                playerData.secondarySubtitleStreamIndex = mediaSource.DefaultSecondarySubtitleStreamIndex;
+            } else {
+                playerData.audioStreamIndex = null;
+                playerData.subtitleStreamIndex = null;
+                playerData.secondarySubtitleStreamIndex = null;
+            }
+
+            self._playNextAfterEnded = true;
+
+            const playOptions = itemInfo.item.playOptions || getDefaultPlayOptions();
+            const startState = self.getPlayerState(player, newStreamInfo.item, mediaSource);
+
+            reportPlayback(self, startState, player, true, startState.NowPlayingItem.ServerId, 'reportPlaybackStart');
+
+            startState.IsFirstItem = false;
+            startState.IsFullscreen = playOptions.fullscreen;
+            Events.trigger(player, 'playbackstart', [startState]);
+            Events.trigger(self, 'playbackstart', [player, startState]);
+
+            // only used internally as a safeguard to avoid reporting other events to the server before playback start
+            newStreamInfo.started = true;
+
+            startPlaybackProgressTimer(player);
+        }
+
         function initLegacyVolumeMethods(player) {
             player.getVolume = function () {
                 return player.volume();
@@ -3632,6 +3801,8 @@ export class PlaybackManager {
                 Events.on(player, 'playlistitemmove', onPlaylistItemMove);
                 Events.on(player, 'playlistitemremove', onPlaylistItemRemove);
                 Events.on(player, 'playlistitemadd', onPlaylistItemAdd);
+                Events.on(player, 'gaplessqueuenext', onGaplessQueueNext);
+                Events.on(player, 'gaplesstrackboundary', onGaplessTrackBoundary);
             } else if (player.isLocalPlayer) {
                 Events.on(player, 'itemstarted', onPlaybackStartedFromSelfManagingPlayer);
                 Events.on(player, 'itemstopped', onPlaybackStoppedFromSelfManagingPlayer);
@@ -4123,6 +4294,7 @@ export class PlaybackManager {
 
         this._playQueueManager.setRepeatMode(value);
         Events.trigger(player, 'repeatmodechange');
+        this._refreshGaplessNext(player);
     }
 
     getRepeatMode(player = this._currentPlayer) {
@@ -4140,6 +4312,7 @@ export class PlaybackManager {
 
         this._playQueueManager.setShuffleMode(value);
         Events.trigger(player, 'shufflequeuemodechange');
+        this._refreshGaplessNext(player);
     }
 
     getQueueShuffleMode(player = this._currentPlayer) {
@@ -4166,6 +4339,7 @@ export class PlaybackManager {
             }
         } else {
             this._playQueueManager.toggleShuffleMode();
+            this._refreshGaplessNext(player);
         }
         Events.trigger(player, 'shufflequeuemodechange');
     }
@@ -4177,6 +4351,7 @@ export class PlaybackManager {
 
         this._playQueueManager.clearPlaylist(clearCurrentItem);
         Events.trigger(player, 'playlistitemremove');
+        this._refreshGaplessNext(player);
     }
 
     trySetActiveDeviceName(name) {

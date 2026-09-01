@@ -88,9 +88,9 @@ async function remuxFlacToFmp4(arrayBuffer) {
     // Patch the samplesize field in the sample entry to match STREAMINFO.
     let patchedSampleSize = null;
     if (decoderConfig && decoderConfig.description) {
-        const desc = new Uint8Array(decoderConfig.description.buffer
-            ? decoderConfig.description.buffer.slice(decoderConfig.description.byteOffset, decoderConfig.description.byteOffset + decoderConfig.description.byteLength)
-            : decoderConfig.description);
+        const desc = new Uint8Array(decoderConfig.description.buffer ?
+            decoderConfig.description.buffer.slice(decoderConfig.description.byteOffset, decoderConfig.description.byteOffset + decoderConfig.description.byteLength) :
+            decoderConfig.description);
         // desc = 'fLaC' + 4-byte metadata block header + 34-byte STREAMINFO
         const si = 8; // start of STREAMINFO within desc
         const bps = (((desc[si + 12] & 0x01) << 4) | (desc[si + 13] >> 4)) + 1;
@@ -155,6 +155,12 @@ class GaplessEngine {
         this._fetchControllers = new Set();
         this._nextFetchControllers = new Set();
         this._boundListeners = null;
+        this._nextAppendInFlight = false;
+
+        // Rejects a pending _openMediaSource() wait; a MediaSource detached
+        // before it ever attaches fires neither sourceopen nor sourceclose,
+        // so reset() must settle the wait itself.
+        this._openReject = null;
 
         /**
          * Fired from the internal timeupdate listener when the playhead
@@ -174,9 +180,11 @@ class GaplessEngine {
      * @returns {boolean} True when MSE FLAC-in-MP4 playback is available.
      */
     static isSupported() {
+        /* eslint-disable compat/compat -- feature-detected right here */
         return !!(window.MediaSource
             && typeof MediaSource.isTypeSupported === 'function'
             && MediaSource.isTypeSupported(MIME_TYPE));
+        /* eslint-enable compat/compat */
     }
 
     /**
@@ -212,7 +220,9 @@ class GaplessEngine {
      *
      * @param {string} url - Pre-authenticated direct-play stream URL.
      * @param {Object} itemInfo - { playlistItemId, item, streamInfo } (opaque).
-     * @returns {Promise<void>}
+     * @returns {Promise<boolean>} True when the timeline started; false when
+     *     superseded by a newer start()/reset() (the caller must then leave
+     *     the element alone — the newer session owns it).
      */
     async start(url, itemInfo) {
         this.reset();
@@ -233,9 +243,10 @@ class GaplessEngine {
                 this._currentIndex = 0;
             });
             console.debug(`[gaplessEngine] timeline started: codec=${remuxed.codec} rate=${remuxed.sampleRate} channels=${remuxed.numberOfChannels} duration=${remuxed.duration.toFixed(3)}s`);
+            return true;
         } catch (e) {
             if (e instanceof SupersededError) {
-                return;
+                return false;
             }
             console.debug('[gaplessEngine] start failed:', e && e.message ? e.message : e);
             throw e;
@@ -254,6 +265,17 @@ class GaplessEngine {
         if (!this._mediaSource || this._queueEnded) {
             return;
         }
+        // Single-future-slot invariant: at most one timeline entry beyond the
+        // current track, and at most one append in flight. Deduplicates
+        // double-resolution races (two 'gaplessqueuenext' answers for the
+        // same boundary) and keeps the buffered window modest for TV memory.
+        // RepeatOne still works: the boundary crossing advances _currentIndex
+        // before the next append request arrives, freeing the slot.
+        const effectiveIndex = Math.max(this._currentIndex, 0);
+        if (this._nextAppendInFlight || this._entries.length > effectiveIndex + 1) {
+            return;
+        }
+        this._nextAppendInFlight = true;
         const generation = this._generation;
         const epoch = this._nextEpoch;
         this._pendingAppends++;
@@ -286,6 +308,11 @@ class GaplessEngine {
             console.debug('[gaplessEngine] appendNext failed:', e && e.message ? e.message : e);
             throw e;
         } finally {
+            // Only clear the slot when this call still owns it; a superseding
+            // reset()/invalidateNext() already cleared it for the next caller.
+            if (generation === this._generation && epoch === this._nextEpoch) {
+                this._nextAppendInFlight = false;
+            }
             if (generation === this._generation) {
                 this._pendingAppends--;
                 this._maybeEndOfStream();
@@ -304,6 +331,7 @@ class GaplessEngine {
             controller.abort();
         }
         this._nextFetchControllers.clear();
+        this._nextAppendInFlight = false;
         this._queueEnded = false;
         this._endOfStreamCalled = false;
 
@@ -375,7 +403,8 @@ class GaplessEngine {
         const index = this._currentIndex >= 0 ? this._currentIndex : 0;
         const entry = this._entries[index];
         if (!entry) {
-            throw new Error('gapless engine has no timeline');
+            console.debug('[gaplessEngine] seek ignored: no timeline');
+            return;
         }
         const position = Math.min(Math.max(seconds, 0), entry.duration);
         const target = entry.startTime + position;
@@ -385,7 +414,11 @@ class GaplessEngine {
         }
         // Outside the buffered window (trimmed): rebuild from this track.
         const wasPaused = this._element.paused;
-        await this.start(entry.url, entry.itemInfo);
+        const started = await this.start(entry.url, entry.itemInfo);
+        if (!started) {
+            // Superseded by a newer session; it owns the element now.
+            return;
+        }
         this._element.currentTime = position;
         if (!wasPaused) {
             try {
@@ -404,6 +437,11 @@ class GaplessEngine {
     reset() {
         this._generation++;
         this._nextEpoch++;
+
+        if (this._openReject) {
+            this._openReject(new SupersededError());
+            this._openReject = null;
+        }
 
         for (const controller of this._fetchControllers) {
             controller.abort();
@@ -427,6 +465,7 @@ class GaplessEngine {
         this._entries = [];
         this._currentIndex = -1;
         this._pendingAppends = 0;
+        this._nextAppendInFlight = false;
         this._queueEnded = false;
         this._endOfStreamCalled = false;
         this._operationChain = Promise.resolve();
@@ -439,14 +478,21 @@ class GaplessEngine {
      * @private
      */
     async _openMediaSource(generation) {
-        const mediaSource = new MediaSource();
+        const mediaSource = new MediaSource(); /* eslint-disable-line compat/compat -- gated by isSupported() */
         this._mediaSource = mediaSource;
-        this._objectUrl = URL.createObjectURL(mediaSource);
+        this._objectUrl = URL.createObjectURL(mediaSource); /* eslint-disable-line compat/compat -- gated by isSupported() */
         this._attachElementListeners();
         this._element.src = this._objectUrl;
+        let rejectRef = null;
         await new Promise((resolve, reject) => {
+            rejectRef = reject;
+            this._openReject = reject;
             mediaSource.addEventListener('sourceopen', resolve, { once: true });
             mediaSource.addEventListener('sourceclose', () => reject(new SupersededError()), { once: true });
+        }).finally(() => {
+            if (this._openReject === rejectRef) {
+                this._openReject = null;
+            }
         });
         this._checkGeneration(generation);
         this._sourceBuffer = mediaSource.addSourceBuffer(MIME_TYPE);
@@ -463,7 +509,7 @@ class GaplessEngine {
      * @private
      */
     async _fetchAndRemux(url, generation, isNext) {
-        const controller = new AbortController();
+        const controller = new AbortController(); /* eslint-disable-line compat/compat -- gated by isSupported() */
         this._fetchControllers.add(controller);
         if (isNext) {
             this._nextFetchControllers.add(controller);
@@ -620,7 +666,7 @@ class GaplessEngine {
         let buffered;
         try {
             buffered = sourceBuffer.buffered;
-        } catch (e) {
+        } catch {
             return false;
         }
         for (let i = 0; i < buffered.length; i++) {
@@ -697,7 +743,7 @@ class GaplessEngine {
         let buffered;
         try {
             buffered = sourceBuffer.buffered;
-        } catch (e) {
+        } catch {
             return;
         }
         // Only bother when at least a second of trimmable data has built up.
