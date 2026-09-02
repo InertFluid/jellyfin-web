@@ -96,6 +96,14 @@
             <div class="fieldDescription checkboxFieldDescription">${PreferFmp4HlsContainerHelp}</div>
         </div>
 
+        <div class="checkboxContainer checkboxContainer-withDescription">
+            <label>
+                <input type="checkbox" is="emby-checkbox" class="chkEnableGaplessAudio" />
+                <span>Enable gapless audio (experimental)</span>
+            </label>
+            <div class="fieldDescription checkboxFieldDescription">Play consecutive lossless (FLAC) tracks through a single audio pipeline for gapless transitions. Direct play only; other audio is unaffected. Manually selected tracks may take a moment to load.</div>
+        </div>
+
         <div class="checkboxContainer checkboxContainer-withDescription cinemaModeOptions">
             <label>
                 <input type="checkbox" is="emby-checkbox" class="chkEnableCinemaMode" />

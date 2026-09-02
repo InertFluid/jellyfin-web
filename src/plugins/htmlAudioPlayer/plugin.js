@@ -8,7 +8,13 @@ import profileBuilder from '../../scripts/browserDeviceProfile';
 import { getIncludeCorsCredentials } from '../../scripts/settings/webSettings';
 import { PluginType } from '../../types/plugin.ts';
 import Events from '../../utils/events.ts';
+import { currentSettings as appUserSettings } from '../../scripts/settings/userSettings';
 import GaplessEngine from './gaplessEngine';
+
+/** Whether the experimental gapless engine is enabled and usable here. */
+function gaplessEnabled() {
+    return GaplessEngine.isSupported() && appUserSettings.enableGaplessAudio();
+}
 
 function getDefaultProfile() {
     return profileBuilder({});
@@ -102,16 +108,19 @@ class HtmlAudioPlayer {
         self._gaplessEngine = null;
         self._gaplessActive = false;
 
-        // Use the full server PlaybackInfo for audio instead of the universal
-        // fast-path. The universal endpoint fabricates a MediaSource with empty
-        // MediaStreams and defers the direct-play/transcode decision to the
-        // server, so the client never learns the real codec or gets a direct
-        // file URL — leaving the gapless engine unable to detect eligible FLAC.
-        // Real PlaybackInfo yields a proper MediaSource (codec, SupportsDirectPlay)
-        // and a static stream.<container> URL the engine can remux.
-        if (GaplessEngine.isSupported()) {
-            self.useServerPlaybackInfoForAudio = true;
-        }
+        // When gapless is enabled, use the full server PlaybackInfo for audio
+        // instead of the universal fast-path. The universal endpoint fabricates
+        // a MediaSource with empty MediaStreams and defers the direct-play vs
+        // transcode decision to the server, so the client never learns the real
+        // codec or gets a direct file URL — leaving the gapless engine unable to
+        // detect eligible FLAC. Real PlaybackInfo yields a proper MediaSource
+        // (codec, SupportsDirectPlay) and a static stream.<container> URL the
+        // engine can remux. Dynamic getter so toggling the setting takes effect
+        // without reload and audio reverts to the stock fast-path when disabled.
+        Object.defineProperty(self, 'useServerPlaybackInfoForAudio', {
+            configurable: true,
+            get: () => gaplessEnabled()
+        });
 
         self.play = function (options) {
             self._started = false;
@@ -132,7 +141,7 @@ class HtmlAudioPlayer {
         };
 
         function isGaplessEligible(options) {
-            return GaplessEngine.isSupported()
+            return gaplessEnabled()
                 && options.item?.MediaType === 'Audio'
                 && (options.playMethod === 'DirectPlay' || options.playMethod === 'DirectStream')
                 && GaplessEngine.isEligibleUrl(options.url, options.mediaSource);

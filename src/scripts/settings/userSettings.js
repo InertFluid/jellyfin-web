@@ -166,6 +166,21 @@ export class UserSettings {
     }
 
     /**
+     * Get or set 'Gapless Audio Playback' state (experimental). When enabled,
+     * consecutive direct-play FLAC tracks are played through a single MediaSource
+     * for gapless transitions. Defaults off.
+     * @param {boolean|undefined} val - Flag to enable gapless audio, or undefined.
+     * @returns {boolean} Gapless audio state.
+     */
+    enableGaplessAudio(val) {
+        if (val !== undefined) {
+            return this.set('enableGaplessAudio', val.toString(), false);
+        }
+
+        return toBoolean(this.get('enableGaplessAudio', false), false);
+    }
+
+    /**
      * Get or set 'Limit Segment Length' state.
      * @param {boolean|undefined} val - Flag to enable 'Limit Segment Length' or undefined.
      * @returns {boolean} 'Limit Segment Length' state.

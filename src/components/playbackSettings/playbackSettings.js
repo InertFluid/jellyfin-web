@@ -226,6 +226,7 @@ function loadForm(context, user, userSettings, systemInfo, apiClient) {
 
     context.querySelector('.chkPlayDefaultAudioTrack').checked = user.Configuration.PlayDefaultAudioTrack || false;
     context.querySelector('.chkPreferFmp4HlsContainer').checked = userSettings.preferFmp4HlsContainer();
+    context.querySelector('.chkEnableGaplessAudio').checked = userSettings.enableGaplessAudio();
     context.querySelector('.chkLimitSegmentLength').checked = userSettings.limitSegmentLength();
     context.querySelector('.chkEnableDts').checked = appSettings.enableDts();
     context.querySelector('.chkEnableTrueHd').checked = appSettings.enableTrueHd();
@@ -300,6 +301,7 @@ function saveUser(context, user, userSettingsInstance, apiClient) {
     user.Configuration.PlayDefaultAudioTrack = context.querySelector('.chkPlayDefaultAudioTrack').checked;
     user.Configuration.EnableNextEpisodeAutoPlay = context.querySelector('.chkEpisodeAutoPlay').checked;
     userSettingsInstance.preferFmp4HlsContainer(context.querySelector('.chkPreferFmp4HlsContainer').checked);
+    userSettingsInstance.enableGaplessAudio(context.querySelector('.chkEnableGaplessAudio').checked);
     userSettingsInstance.limitSegmentLength(context.querySelector('.chkLimitSegmentLength').checked);
     userSettingsInstance.enableCinemaMode(context.querySelector('.chkEnableCinemaMode').checked);
     userSettingsInstance.selectAudioNormalization(context.querySelector('#selectAudioNormalization').value);
