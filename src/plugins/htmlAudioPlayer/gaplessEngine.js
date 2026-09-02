@@ -25,7 +25,15 @@ import {
 const MIME_TYPE = 'audio/mp4; codecs="flac"';
 
 /** Seconds of already-played audio kept behind the playhead before trimming. */
-const TRIM_BEHIND_SECONDS = 30;
+const TRIM_BEHIND_SECONDS = 8;
+
+/**
+ * Seconds of audio the pump keeps buffered ahead of the playhead. Combined
+ * with TRIM_BEHIND_SECONDS this bounds total buffered content well under the
+ * browser's audio SourceBuffer memory limit (~12 MB) even for hi-res FLAC, so
+ * a whole track is never appended at once.
+ */
+const AHEAD_SECONDS = 15;
 
 /** Muxed timescales round (~1µs short); never compare times exactly. */
 const TIME_EPSILON = 0.001;
@@ -122,6 +130,73 @@ async function remuxFlacToFmp4(arrayBuffer) {
 }
 
 /**
+ * Split a complete fragmented-MP4 buffer into an init segment (everything up
+ * to the first `moof`: ftyp + moov) and an ordered list of media fragments
+ * (each a `moof` plus its following `mdat`), by walking TOP-LEVEL boxes only.
+ *
+ * A whole lossless track is far larger than the browser's audio SourceBuffer
+ * memory limit, so it cannot be appended in one call; the engine appends the
+ * init segment once and then meters these fragments in behind a bounded
+ * look-ahead window.
+ *
+ * @param {ArrayBuffer} arrayBuffer - Complete fragmented MP4.
+ * @returns {{ initSegment: Uint8Array, fragments: Uint8Array[] }}
+ */
+function splitFragmentedMp4(arrayBuffer) {
+    const bytes = new Uint8Array(arrayBuffer);
+    const view = new DataView(arrayBuffer);
+    const boxes = [];
+    let offset = 0;
+    while (offset + 8 <= bytes.length) {
+        let size = view.getUint32(offset);
+        const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+        let headerSize = 8;
+        if (size === 1) {
+            // 64-bit largesize (rare for audio fragments)
+            const high = view.getUint32(offset + 8);
+            const low = view.getUint32(offset + 12);
+            size = (high * 4294967296) + low;
+            headerSize = 16;
+        } else if (size === 0) {
+            // Box extends to end of file
+            size = bytes.length - offset;
+        }
+        if (size < headerSize || offset + size > bytes.length) {
+            // Truncated/malformed tail; stop walking.
+            break;
+        }
+        boxes.push({ type, start: offset, end: offset + size });
+        offset += size;
+    }
+
+    const firstMoof = boxes.findIndex((b) => b.type === 'moof');
+    if (firstMoof === -1) {
+        // No fragments found (unexpected): treat the whole buffer as the init.
+        return { initSegment: bytes.slice(0), fragments: [] };
+    }
+
+    const initSegment = bytes.slice(0, boxes[firstMoof].start);
+    const fragments = [];
+    let i = firstMoof;
+    while (i < boxes.length) {
+        if (boxes[i].type !== 'moof') {
+            i++;
+            continue;
+        }
+        // Group this moof with everything up to (but not including) the next moof.
+        let end = boxes[i].end;
+        let j = i + 1;
+        while (j < boxes.length && boxes[j].type !== 'moof') {
+            end = boxes[j].end;
+            j++;
+        }
+        fragments.push(bytes.slice(boxes[i].start, end));
+        i = j;
+    }
+    return { initSegment, fragments };
+}
+
+/**
  * Gapless playback engine bound to a single media element.
  */
 class GaplessEngine {
@@ -156,6 +231,9 @@ class GaplessEngine {
         this._nextFetchControllers = new Set();
         this._boundListeners = null;
         this._nextAppendInFlight = false;
+
+        // Streaming append: only one pump append is scheduled at a time.
+        this._pumping = false;
 
         // Rejects a pending _openMediaSource() wait; a MediaSource detached
         // before it ever attaches fires neither sourceopen nor sourceclose,
@@ -230,19 +308,24 @@ class GaplessEngine {
         try {
             await this._openMediaSource(generation);
             const remuxed = await this._fetchAndRemux(url, generation, false);
-            await this._enqueueOperation(generation, async () => {
-                this._sourceBuffer.timestampOffset = 0;
-                await this._appendToSourceBuffer(remuxed.buffer);
-                this._entries.push({
-                    index: 0,
-                    url,
-                    itemInfo,
-                    startTime: 0,
-                    duration: remuxed.duration
-                });
-                this._currentIndex = 0;
+            this._checkGeneration(generation);
+            // Entry 0 is known to start at media time 0.
+            this._entries.push({
+                index: 0,
+                url,
+                itemInfo,
+                initSegment: remuxed.initSegment,
+                fragments: remuxed.fragments,
+                appendCursor: 0,
+                initAppended: false,
+                startTime: 0,
+                duration: remuxed.duration
             });
-            console.debug(`[gaplessEngine] timeline started: codec=${remuxed.codec} rate=${remuxed.sampleRate} channels=${remuxed.numberOfChannels} duration=${remuxed.duration.toFixed(3)}s`);
+            this._currentIndex = 0;
+            console.debug(`[gaplessEngine] timeline started: codec=${remuxed.codec} rate=${remuxed.sampleRate} channels=${remuxed.numberOfChannels} duration=${remuxed.duration.toFixed(3)}s fragments=${remuxed.fragments.length}`);
+            // Prime the buffer: appends the init segment and enough fragments to
+            // begin playback, then keeps a bounded look-ahead as playback runs.
+            this._pump();
             return true;
         } catch (e) {
             if (e instanceof SupersededError) {
@@ -254,8 +337,10 @@ class GaplessEngine {
     }
 
     /**
-     * Fetch + remux + append a track as the next timeline entry. Resolves as
-     * a silent no-op if superseded by reset()/start()/invalidateNext().
+     * Fetch + remux the next track and store it as the prepared next timeline
+     * entry. The data is NOT appended here — the pump appends it (init at the
+     * current buffered end, then fragments) as the playhead nears the seam, so
+     * the SourceBuffer stays bounded. Silent no-op if superseded.
      *
      * @param {string} url - Pre-authenticated direct-play stream URL.
      * @param {Object} itemInfo - { playlistItemId, item, streamInfo } (opaque).
@@ -266,11 +351,10 @@ class GaplessEngine {
             return;
         }
         // Single-future-slot invariant: at most one timeline entry beyond the
-        // current track, and at most one append in flight. Deduplicates
+        // current track, and at most one prepare in flight. Deduplicates
         // double-resolution races (two 'gaplessqueuenext' answers for the
-        // same boundary) and keeps the buffered window modest for TV memory.
-        // RepeatOne still works: the boundary crossing advances _currentIndex
-        // before the next append request arrives, freeing the slot.
+        // same boundary). RepeatOne still works: the boundary crossing advances
+        // _currentIndex before the next request arrives, freeing the slot.
         const effectiveIndex = Math.max(this._currentIndex, 0);
         if (this._nextAppendInFlight || this._entries.length > effectiveIndex + 1) {
             return;
@@ -282,25 +366,20 @@ class GaplessEngine {
         try {
             const remuxed = await this._fetchAndRemux(url, generation, true);
             this._checkEpoch(generation, epoch);
-            await this._enqueueOperation(generation, async () => {
-                this._checkEpoch(generation, epoch);
-                if (!this._sourceBuffer) {
-                    throw new Error('gapless engine has no source buffer');
-                }
-                // The authoritative offset for track N+1 is the buffered end
-                // after track N has fully appended (muxed timescale rounds).
-                const buffered = this._sourceBuffer.buffered;
-                const offset = buffered.length ? buffered.end(buffered.length - 1) : 0;
-                this._sourceBuffer.timestampOffset = offset;
-                await this._appendToSourceBuffer(remuxed.buffer);
-                this._entries.push({
-                    index: this._entries.length,
-                    url,
-                    itemInfo,
-                    startTime: offset,
-                    duration: remuxed.duration
-                });
+            // startTime is resolved lazily when the pump appends this entry's
+            // init segment (it becomes the buffered end at that moment).
+            this._entries.push({
+                index: this._entries.length,
+                url,
+                itemInfo,
+                initSegment: remuxed.initSegment,
+                fragments: remuxed.fragments,
+                appendCursor: 0,
+                initAppended: false,
+                startTime: null,
+                duration: remuxed.duration
             });
+            this._pump();
         } catch (e) {
             if (e instanceof SupersededError) {
                 return;
@@ -340,6 +419,14 @@ class GaplessEngine {
         }
         const firstFuture = this._entries[this._currentIndex + 1];
         this._entries.length = this._currentIndex + 1;
+
+        // A prepared-but-not-yet-appended future entry has no buffered data and
+        // no resolved startTime; dropping it from the timeline is enough.
+        if (firstFuture.startTime == null) {
+            return;
+        }
+
+        const removeFrom = firstFuture.startTime;
         const generation = this._generation;
         this._enqueueOperation(generation, async () => {
             const sourceBuffer = this._sourceBuffer;
@@ -347,8 +434,8 @@ class GaplessEngine {
                 return;
             }
             const buffered = sourceBuffer.buffered;
-            if (buffered.length && buffered.end(buffered.length - 1) > firstFuture.startTime + TIME_EPSILON) {
-                await this._removeFromSourceBuffer(firstFuture.startTime, Number.POSITIVE_INFINITY);
+            if (buffered.length && buffered.end(buffered.length - 1) > removeFrom + TIME_EPSILON) {
+                await this._removeFromSourceBuffer(removeFrom, Number.POSITIVE_INFINITY);
             }
         }).catch(() => { /* superseded or nothing to remove */ });
     }
@@ -361,6 +448,9 @@ class GaplessEngine {
      */
     markQueueEnd() {
         this._queueEnded = true;
+        // The last fragments may still be streaming in; the pump calls
+        // _maybeEndOfStream() once nothing remains to append.
+        this._pump();
         this._maybeEndOfStream();
     }
 
@@ -393,8 +483,11 @@ class GaplessEngine {
     }
 
     /**
-     * Seek within the current logical track. Positions outside the buffered
-     * range (e.g. trimmed behind the playhead) trigger an internal rebuild.
+     * Seek within the current logical track.
+     * - Target already buffered: jump straight there.
+     * - Forward, past the buffered end but within the loaded track: jump and
+     *   let the pump fill from its cursor (all fragments are already in memory).
+     * - Backward into data trimmed behind the playhead: rebuild from this track.
      *
      * @param {number} seconds - In-track position.
      * @returns {Promise<void>}
@@ -402,7 +495,7 @@ class GaplessEngine {
     async seek(seconds) {
         const index = this._currentIndex >= 0 ? this._currentIndex : 0;
         const entry = this._entries[index];
-        if (!entry) {
+        if (!entry || entry.startTime == null) {
             console.debug('[gaplessEngine] seek ignored: no timeline');
             return;
         }
@@ -412,7 +505,13 @@ class GaplessEngine {
             this._element.currentTime = target;
             return;
         }
-        // Outside the buffered window (trimmed): rebuild from this track.
+        if (target >= this._bufferedEnd()) {
+            // Forward within the loaded track: jump and let the pump catch up.
+            this._element.currentTime = target;
+            this._pump();
+            return;
+        }
+        // Backward into trimmed data: rebuild from this track.
         const wasPaused = this._element.paused;
         const started = await this.start(entry.url, entry.itemInfo);
         if (!started) {
@@ -466,6 +565,7 @@ class GaplessEngine {
         this._currentIndex = -1;
         this._pendingAppends = 0;
         this._nextAppendInFlight = false;
+        this._pumping = false;
         this._queueEnded = false;
         this._endOfStreamCalled = false;
         this._operationChain = Promise.resolve();
@@ -523,7 +623,17 @@ class GaplessEngine {
             this._checkGeneration(generation);
             const remuxed = await remuxFlacToFmp4(arrayBuffer);
             this._checkGeneration(generation);
-            return remuxed;
+            // Split into an init segment + individually-appendable fragments so
+            // the pump can meter a large track into the bounded SourceBuffer.
+            const { initSegment, fragments } = splitFragmentedMp4(remuxed.buffer);
+            return {
+                initSegment,
+                fragments,
+                duration: remuxed.duration,
+                codec: remuxed.codec,
+                sampleRate: remuxed.sampleRate,
+                numberOfChannels: remuxed.numberOfChannels
+            };
         } catch (e) {
             if (controller.signal.aborted) {
                 throw new SupersededError();
@@ -611,17 +721,135 @@ class GaplessEngine {
     }
 
     /**
-     * Call endOfStream() once the queue is marked ended and every pending
-     * append has fully landed in the SourceBuffer.
+     * @returns {number} Media-time end of the last buffered range, or 0.
+     * @private
+     */
+    _bufferedEnd() {
+        const sourceBuffer = this._sourceBuffer;
+        if (!sourceBuffer) {
+            return 0;
+        }
+        let buffered;
+        try {
+            buffered = sourceBuffer.buffered;
+        } catch {
+            return 0;
+        }
+        return buffered.length ? buffered.end(buffered.length - 1) : 0;
+    }
+
+    /**
+     * The next unit to append: the first entry needing its init segment, then
+     * that entry's next fragment. Entries are appended fully and in order, so
+     * this walks to the first with outstanding work.
+     * @returns {?{type: string, entry: Object}}
+     * @private
+     */
+    _nextAppendUnit() {
+        for (const entry of this._entries) {
+            if (!entry.initAppended) {
+                return { type: 'init', entry };
+            }
+            if (entry.appendCursor < entry.fragments.length) {
+                return { type: 'frag', entry };
+            }
+        }
+        return null;
+    }
+
+    /** @returns {boolean} Whether every timeline entry is fully appended. @private */
+    _allAppended() {
+        for (const entry of this._entries) {
+            if (!entry.initAppended || entry.appendCursor < entry.fragments.length) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Streaming append scheduler. Appends the init segment of the next entry
+     * that needs it, then meters in fragments until AHEAD_SECONDS are buffered
+     * beyond the playhead. Re-invokes itself after each append and is also
+     * driven by 'timeupdate'. Exactly one append is scheduled at a time.
+     * @private
+     */
+    _pump() {
+        if (this._pumping) {
+            return;
+        }
+        if (!this._sourceBuffer || !this._mediaSource || this._mediaSource.readyState !== 'open') {
+            return;
+        }
+
+        const unit = this._nextAppendUnit();
+        if (!unit) {
+            // Nothing left to append; may be the end of the queue.
+            this._maybeEndOfStream();
+            return;
+        }
+
+        // Fragments are gated by the look-ahead window; init segments are tiny
+        // and always allowed (they don't add playable time on their own).
+        if (unit.type === 'frag' && (this._bufferedEnd() - this._element.currentTime) >= AHEAD_SECONDS) {
+            return;
+        }
+
+        this._pumping = true;
+        const generation = this._generation;
+        this._enqueueOperation(generation, async () => {
+            if (!this._sourceBuffer || !this._mediaSource || this._mediaSource.readyState !== 'open') {
+                return;
+            }
+            if (unit.type === 'init') {
+                // Entry 0 starts at 0; later entries butt-join at the buffered end.
+                const offset = unit.entry.index === 0 ? 0 : this._bufferedEnd();
+                this._sourceBuffer.timestampOffset = offset;
+                unit.entry.startTime = offset;
+                await this._appendToSourceBuffer(unit.entry.initSegment);
+                unit.entry.initAppended = true;
+            } else {
+                const fragment = unit.entry.fragments[unit.entry.appendCursor];
+                await this._appendToSourceBuffer(fragment);
+                unit.entry.appendCursor++;
+            }
+        }).then(() => {
+            this._pumping = false;
+            this._pump();
+        }).catch((e) => {
+            this._pumping = false;
+            if (e instanceof SupersededError) {
+                return;
+            }
+            if (e && e.name === 'QuotaExceededError') {
+                // Buffer momentarily full: trim aggressively and retry on the
+                // next timeupdate. The cursor did not advance, so no data is lost.
+                console.debug('[gaplessEngine] append quota hit; trimming and backing off');
+                this._trimBehindPlayhead(this._element.currentTime, true);
+                return;
+            }
+            console.debug('[gaplessEngine] pump append failed:', e && e.message ? e.message : e);
+            if (typeof this.onEngineError === 'function') {
+                this.onEngineError(e);
+            }
+        });
+    }
+
+    /**
+     * Call endOfStream() once the queue is marked ended and every entry's data
+     * has fully landed in the SourceBuffer.
      * @private
      */
     _maybeEndOfStream() {
         if (!this._queueEnded || this._pendingAppends > 0 || this._endOfStreamCalled) {
             return;
         }
+        if (!this._allAppended()) {
+            return;
+        }
         const generation = this._generation;
         this._enqueueOperation(generation, () => {
-            if (!this._queueEnded || this._pendingAppends > 0 || this._endOfStreamCalled) {
+            if (!this._queueEnded || this._pendingAppends > 0 || this._endOfStreamCalled || !this._allAppended()) {
                 return;
             }
             if (this._mediaSource && this._mediaSource.readyState === 'open') {
@@ -638,8 +866,14 @@ class GaplessEngine {
      * @private
      */
     _indexForTime(time) {
+        // Only entries whose init has been appended have a resolved startTime;
+        // they form a prefix of the timeline (appended strictly in order).
+        let placed = this._entries.length;
+        while (placed > 0 && this._entries[placed - 1].startTime == null) {
+            placed--;
+        }
         let low = 0;
-        let high = this._entries.length - 1;
+        let high = placed - 1;
         let result = -1;
         while (low <= high) {
             const mid = (low + high) >> 1;
@@ -721,20 +955,27 @@ class GaplessEngine {
                 this.onTrackBoundary(index, entry.itemInfo, previousEntry ? previousEntry.itemInfo : null);
             }
         }
+        // Keep the look-ahead window filled and reclaim played data.
+        this._pump();
         this._trimBehindPlayhead(time);
     }
 
     /**
      * Opportunistically remove played data more than TRIM_BEHIND_SECONDS
-     * behind the playhead, keeping the buffered window modest (TV memory).
-     * Skipped whenever an operation is already running or queued work exists.
+     * behind the playhead, keeping the buffered window modest (TV memory,
+     * SourceBuffer quota). Skipped whenever an operation is already running,
+     * unless force is set (quota-backoff retry).
      * @param {number} time
+     * @param {boolean} [force] - Enqueue the trim even if an op is running.
      * @private
      */
-    _trimBehindPlayhead(time) {
+    _trimBehindPlayhead(time, force) {
         const sourceBuffer = this._sourceBuffer;
         const trimEnd = time - TRIM_BEHIND_SECONDS;
-        if (!sourceBuffer || sourceBuffer.updating || this._operationRunning || trimEnd <= 0) {
+        if (!sourceBuffer || trimEnd <= 0) {
+            return;
+        }
+        if (!force && (sourceBuffer.updating || this._operationRunning)) {
             return;
         }
         if (!this._mediaSource || this._mediaSource.readyState !== 'open') {
