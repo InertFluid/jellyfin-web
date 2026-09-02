@@ -102,6 +102,17 @@ class HtmlAudioPlayer {
         self._gaplessEngine = null;
         self._gaplessActive = false;
 
+        // Use the full server PlaybackInfo for audio instead of the universal
+        // fast-path. The universal endpoint fabricates a MediaSource with empty
+        // MediaStreams and defers the direct-play/transcode decision to the
+        // server, so the client never learns the real codec or gets a direct
+        // file URL — leaving the gapless engine unable to detect eligible FLAC.
+        // Real PlaybackInfo yields a proper MediaSource (codec, SupportsDirectPlay)
+        // and a static stream.<container> URL the engine can remux.
+        if (GaplessEngine.isSupported()) {
+            self.useServerPlaybackInfoForAudio = true;
+        }
+
         self.play = function (options) {
             self._started = false;
             self._timeUpdated = false;
