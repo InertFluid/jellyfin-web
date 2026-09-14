@@ -529,7 +529,20 @@ class HtmlAudioPlayer {
                 self._started = true;
                 this.removeAttribute('controls');
 
-                htmlMediaHelper.seekOnPlaybackStart(self, e.target, self._currentPlayOptions.playerStartPositionTicks);
+                if (self._gaplessActive && self._gaplessEngine) {
+                    // The stock path sets element.currentTime directly, which
+                    // bypasses the engine's buffered/forward/backward-rebuild
+                    // seek logic entirely: a resume position past the initial
+                    // look-ahead window would land in unbuffered territory the
+                    // engine was never told to fill. Route it through the
+                    // engine instead so it fills toward the resume point.
+                    const seconds = (self._currentPlayOptions.playerStartPositionTicks || 0) / 10000000;
+                    if (seconds) {
+                        self._gaplessEngine.seek(seconds).catch((err) => self._gaplessEngine?.onEngineError?.(err));
+                    }
+                } else {
+                    htmlMediaHelper.seekOnPlaybackStart(self, e.target, self._currentPlayOptions.playerStartPositionTicks);
+                }
             }
             Events.trigger(self, 'playing');
         }

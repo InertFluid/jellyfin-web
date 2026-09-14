@@ -38,6 +38,20 @@ const AHEAD_SECONDS = 15;
 /** Muxed timescales round (~1µs short); never compare times exactly. */
 const TIME_EPSILON = 0.001;
 
+/** Delay before retrying an append after a QuotaExceededError. */
+const QUOTA_RETRY_DELAY_MS = 250;
+
+/** Consecutive quota failures on the same append before giving up. */
+const MAX_QUOTA_RETRIES = 20;
+
+/**
+ * Longest a SourceBuffer append/remove may go without firing 'updateend'
+ * before it is treated as stuck. Embedded/TV MSE implementations have been
+ * observed to occasionally drop the event under memory pressure; without a
+ * watchdog that wedges the single-slot operation chain permanently.
+ */
+const SOURCE_BUFFER_UPDATE_TIMEOUT_MS = 10000;
+
 /**
  * Error used internally to mark async continuations that were superseded by
  * a newer reset()/start()/invalidateNext() generation. Always swallowed.
@@ -234,6 +248,7 @@ class GaplessEngine {
 
         // Streaming append: only one pump append is scheduled at a time.
         this._pumping = false;
+        this._quotaRetryCount = 0;
 
         // Rejects a pending _openMediaSource() wait; a MediaSource detached
         // before it ever attaches fires neither sourceopen nor sourceclose,
@@ -430,7 +445,7 @@ class GaplessEngine {
         const generation = this._generation;
         this._enqueueOperation(generation, async () => {
             const sourceBuffer = this._sourceBuffer;
-            if (!sourceBuffer || !this._mediaSource || this._mediaSource.readyState !== 'open') {
+            if (!sourceBuffer || !this._mediaSource || this._mediaSource.readyState === 'closed') {
                 return;
             }
             const buffered = sourceBuffer.buffered;
@@ -566,6 +581,7 @@ class GaplessEngine {
         this._pendingAppends = 0;
         this._nextAppendInFlight = false;
         this._pumping = false;
+        this._quotaRetryCount = 0;
         this._queueEnded = false;
         this._endOfStreamCalled = false;
         this._operationChain = Promise.resolve();
@@ -700,6 +716,7 @@ class GaplessEngine {
             const cleanup = () => {
                 sourceBuffer.removeEventListener('updateend', onEnd);
                 sourceBuffer.removeEventListener('error', onError);
+                clearTimeout(watchdog);
             };
             const onEnd = () => {
                 cleanup();
@@ -709,6 +726,13 @@ class GaplessEngine {
                 cleanup();
                 reject(new Error(`SourceBuffer ${label} error`));
             };
+            // Some embedded/TV MSE implementations have been observed to drop
+            // 'updateend' under memory pressure; without this the single-slot
+            // operation chain would wedge forever with no error surfaced.
+            const watchdog = setTimeout(() => {
+                cleanup();
+                reject(new Error(`SourceBuffer ${label} timed out waiting for updateend`));
+            }, SOURCE_BUFFER_UPDATE_TIMEOUT_MS);
             sourceBuffer.addEventListener('updateend', onEnd);
             sourceBuffer.addEventListener('error', onError);
             try {
@@ -778,7 +802,9 @@ class GaplessEngine {
         if (this._pumping) {
             return;
         }
-        if (!this._sourceBuffer || !this._mediaSource || this._mediaSource.readyState !== 'open') {
+        // 'ended' is fine: appendBuffer()/remove() both auto-reopen a
+        // MediaSource per the MSE spec. Only 'closed' (detached) blocks work.
+        if (!this._sourceBuffer || !this._mediaSource || this._mediaSource.readyState === 'closed') {
             return;
         }
 
@@ -798,15 +824,26 @@ class GaplessEngine {
         this._pumping = true;
         const generation = this._generation;
         this._enqueueOperation(generation, async () => {
-            if (!this._sourceBuffer || !this._mediaSource || this._mediaSource.readyState !== 'open') {
+            if (!this._sourceBuffer || !this._mediaSource || this._mediaSource.readyState === 'closed') {
+                return;
+            }
+            // invalidateNext() truncates _entries synchronously (not through the
+            // operation chain), so an append queued for a future entry before
+            // that happened may reach here after the entry was dropped. Identity
+            // check (not just index) since a later entry could since have been
+            // re-inserted at the same slot.
+            if (this._entries[unit.entry.index] !== unit.entry) {
                 return;
             }
             if (unit.type === 'init') {
                 // Entry 0 starts at 0; later entries butt-join at the buffered end.
                 const offset = unit.entry.index === 0 ? 0 : this._bufferedEnd();
                 this._sourceBuffer.timestampOffset = offset;
-                unit.entry.startTime = offset;
                 await this._appendToSourceBuffer(unit.entry.initSegment);
+                // Only published once the append actually lands, so a failed
+                // append leaves the entry looking unplaced (startTime == null)
+                // rather than reachable-but-empty.
+                unit.entry.startTime = offset;
                 unit.entry.initAppended = true;
             } else {
                 const fragment = unit.entry.fragments[unit.entry.appendCursor];
@@ -815,6 +852,7 @@ class GaplessEngine {
             }
         }).then(() => {
             this._pumping = false;
+            this._quotaRetryCount = 0;
             this._pump();
         }).catch((e) => {
             this._pumping = false;
@@ -822,10 +860,27 @@ class GaplessEngine {
                 return;
             }
             if (e && e.name === 'QuotaExceededError') {
-                // Buffer momentarily full: trim aggressively and retry on the
-                // next timeupdate. The cursor did not advance, so no data is lost.
+                // Buffer momentarily full: trim aggressively and retry. The
+                // cursor did not advance, so no data is lost. Retried directly
+                // (not just via 'timeupdate') since timeupdate may not fire at
+                // all while playback is stalled waiting for this very append,
+                // and capped so a non-recoverable quota condition surfaces as
+                // an engine error instead of hanging silently forever.
+                this._quotaRetryCount = (this._quotaRetryCount || 0) + 1;
+                if (this._quotaRetryCount > MAX_QUOTA_RETRIES) {
+                    console.debug('[gaplessEngine] append quota exceeded repeatedly; giving up');
+                    if (typeof this.onEngineError === 'function') {
+                        this.onEngineError(e);
+                    }
+                    return;
+                }
                 console.debug('[gaplessEngine] append quota hit; trimming and backing off');
                 this._trimBehindPlayhead(this._element.currentTime, true);
+                setTimeout(() => {
+                    if (generation === this._generation) {
+                        this._pump();
+                    }
+                }, QUOTA_RETRY_DELAY_MS);
                 return;
             }
             console.debug('[gaplessEngine] pump append failed:', e && e.message ? e.message : e);
@@ -978,7 +1033,7 @@ class GaplessEngine {
         if (!force && (sourceBuffer.updating || this._operationRunning)) {
             return;
         }
-        if (!this._mediaSource || this._mediaSource.readyState !== 'open') {
+        if (!this._mediaSource || this._mediaSource.readyState === 'closed') {
             return;
         }
         let buffered;
@@ -994,7 +1049,7 @@ class GaplessEngine {
         const generation = this._generation;
         this._enqueueOperation(generation, async () => {
             if (!this._sourceBuffer || this._sourceBuffer.updating
-                || !this._mediaSource || this._mediaSource.readyState !== 'open') {
+                || !this._mediaSource || this._mediaSource.readyState === 'closed') {
                 return;
             }
             await this._removeFromSourceBuffer(0, trimEnd);
