@@ -1,0 +1,229 @@
+/* Vinyl Now-Playing Screensaver
+   Self-contained overlay, independent of Jellyfin's built-in screensaver
+   plugin system. See vinyl-screensaver.js for the idle-timer / now-playing
+   logic. Safe to tweak colors/sizes here without touching the JS.
+
+   "Perspective Stand": album art flat and upright on top, turntable tilted
+   into a tabletop perspective below it - like the cover is leaning upright
+   near a record player viewed at an angle. */
+
+#vinylScreensaverOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.8s ease;
+  font-family: system-ui, -apple-system, sans-serif;
+  overflow: hidden;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+}
+
+#vinylScreensaverOverlay.vs-visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+/* ---- Album art: flat, upright, square, stable (no rotation).
+   Sized up from 220 to 280 so the art + turntable dominate over the text. ---- */
+#vinylScreensaverOverlay .vs-art {
+  width: 280px;
+  height: 280px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #1c1712;
+  box-shadow: 0 20px 36px rgba(0, 0, 0, 0.6);
+}
+
+#vinylScreensaverOverlay .vs-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* ---- Turntable: tilted via rotateX+perspective. Pushed further than before
+   (rotateX 62deg->70deg, perspective 600px->500px, for even more of the
+   near/far asymmetry that reads as tilt) and scaled up from a 220px natural
+   disc to 280px (all inner proportions scaled by 280/220=1.2727) to match
+   the bigger artwork above it.
+   Geometry for 280px disc (half=140), rotateX(70deg), perspective(500px):
+     apparent_top    = -140*cos70 * 500/(500+140*sin70) = -37.9
+     apparent_bottom =  140*cos70 * 500/(500-140*sin70) =  65.0
+     outer height = 103px (exact visual footprint). inner `top` = -102px. ---- */
+#vinylScreensaverOverlay .vs-turntable {
+  width: 280px;
+  height: 103px;
+  margin-top: 20px;
+  position: relative;
+  perspective: 500px;
+}
+
+#vinylScreensaverOverlay .vs-reflection {
+  position: absolute;
+  left: 50%;
+  top: 103px;
+  transform: translateX(-50%);
+  width: 242px;
+  height: 31px;
+  margin-top: -15px;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, rgba(255, 255, 255, 0.07), transparent 72%);
+  z-index: 0;
+}
+
+#vinylScreensaverOverlay .vs-tilt {
+  position: absolute;
+  top: -102px;
+  left: 0;
+  width: 280px;
+  height: 280px;
+  transform: rotateX(70deg);
+  transform-style: preserve-3d;
+  z-index: 1;
+}
+
+#vinylScreensaverOverlay .vs-plinth {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: #171513;
+  box-shadow: 0 10px 18px rgba(0, 0, 0, 0.6), inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+}
+
+#vinylScreensaverOverlay .vs-disc {
+  position: absolute;
+  top: 29px;
+  left: 29px;
+  width: 220px;
+  height: 220px;
+  border-radius: 50%;
+  background: repeating-radial-gradient(circle at center, #1b1917 0px, #1b1917 2px, #121010 3px, #121010 5px);
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.5);
+  animation: vs-spin 8s linear infinite;
+  will-change: transform;
+}
+
+#vinylScreensaverOverlay .vs-sheen {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 26%, rgba(255, 255, 255, 0.12), transparent 42%);
+  pointer-events: none;
+}
+
+#vinylScreensaverOverlay .vs-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 80px;
+  height: 80px;
+  margin: -40px 0 0 -40px;
+  border-radius: 50%;
+  background: #2a211a;
+  box-shadow: 0 0 0 3px #121010;
+}
+
+#vinylScreensaverOverlay .vs-spindle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  background: #121010;
+}
+
+#vinylScreensaverOverlay .vs-tonearm {
+  position: absolute;
+  top: 19px;
+  right: 23px;
+  width: 5px;
+  height: 111px;
+  border-radius: 3px;
+  background: linear-gradient(#cbb89a, #8f7a5c);
+  transform-origin: top center;
+  transform: rotate(25deg);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+#vinylScreensaverOverlay .vs-headshell {
+  position: absolute;
+  top: 107px;
+  left: -6px;
+  width: 15px;
+  height: 8px;
+  border-radius: 2px;
+  background: #2a2420;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+#vinylScreensaverOverlay .vs-hinge {
+  position: absolute;
+  top: 9px;
+  right: 13px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #2a2420;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+/* ---- Text ---- */
+#vinylScreensaverOverlay .vs-meta {
+  margin-top: 22px;
+  text-align: center;
+  max-width: 80vw;
+}
+
+#vinylScreensaverOverlay .vs-title {
+  font-family: 'Fraunces', ui-serif, Georgia, serif;
+  font-weight: 600;
+  font-size: 34px;
+  color: #f5efe6;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+#vinylScreensaverOverlay .vs-artist {
+  margin-top: 8px;
+  font-size: 20px;
+  color: #d8cdbf;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+#vinylScreensaverOverlay .vs-album {
+  margin-top: 4px;
+  font-size: 20px;
+  color: #a89f92;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+@keyframes vs-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #vinylScreensaverOverlay .vs-disc {
+    animation: none;
+  }
+}

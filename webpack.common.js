@@ -85,6 +85,11 @@ const config = {
                 },
                 'config.json',
                 'robots.txt',
+                // Vinyl now-playing screensaver: plain scripts loaded from index.html
+                {
+                    from: 'vinyl-screensaver',
+                    to: 'vinyl-screensaver'
+                },
                 {
                     from: 'touchicon*.png',
                     context: path.resolve(__dirname, 'node_modules/@jellyfin/ux-web/favicons'),
@@ -188,7 +193,13 @@ const config = {
             {
                 test: /\.(html)$/,
                 use: {
-                    loader: 'html-loader'
+                    loader: 'html-loader',
+                    options: {
+                        sources: {
+                            // Copied verbatim by CopyPlugin; don't bundle them.
+                            urlFilter: (_attribute, value) => !value.startsWith('vinyl-screensaver/')
+                        }
+                    }
                 }
             },
             {

@@ -41,7 +41,9 @@ export default tseslint.config(
             'coverage',
             'dist',
             '.idea',
-            '.vscode'
+            '.vscode',
+            // Standalone scripts loaded as-is from index.html (not bundled)
+            'src/vinyl-screensaver'
         ]
     },
 

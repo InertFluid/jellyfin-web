@@ -1,0 +1,9 @@
+Asset: vinyl-record.svg
+Source: https://commons.wikimedia.org/wiki/File:Vinyl_record.svg
+Original: https://upload.wikimedia.org/wikipedia/commons/7/75/Vinyl_record.svg
+Author: BenBois (via OpenClipArt)
+License: Public domain - per the Commons file page, "This image of simple
+geometry is ineligible for copyright and therefore in the public domain,
+because it consists entirely of information that is common property and
+contains no original authorship."
+Retrieved: 2026-10-13
