@@ -9,11 +9,83 @@ import { getIncludeCorsCredentials } from '../../scripts/settings/webSettings';
 import { PluginType } from '../../types/plugin.ts';
 import Events from '../../utils/events.ts';
 import { currentSettings as appUserSettings } from '../../scripts/settings/userSettings';
+import { ServerConnections } from 'lib/jellyfin-apiclient';
 import GaplessEngine from './gaplessEngine';
 
 /** Whether the experimental gapless engine is enabled and usable here. */
 function gaplessEnabled() {
     return GaplessEngine.isSupported() && appUserSettings.enableGaplessAudio();
+}
+
+/**
+ * Audio formats the engine failed on this session (e.g. "flac/192000/24").
+ * They play through the normal player (with its usual gap) instead of
+ * failing again at the start of every track.
+ */
+const failedGaplessFormats = new Set();
+
+function gaplessFormatKey(mediaSource) {
+    const stream = (mediaSource?.MediaStreams || []).find((s) => s?.Type === 'Audio');
+    if (!stream) {
+        return 'flac/unknown';
+    }
+    return `${String(stream.Codec || 'flac').toLowerCase()}/${stream.SampleRate || '?'}/${stream.BitDepth || '?'}`;
+}
+
+/** Size and duration hints for the engine, from the server's media info. */
+function gaplessHints(mediaSource, item) {
+    const ticks = mediaSource?.RunTimeTicks || item?.RunTimeTicks;
+    return {
+        size: mediaSource?.Size || null,
+        duration: ticks ? ticks / 10000000 : null
+    };
+}
+
+/**
+ * Whether an engine error says something about the format on this device,
+ * as opposed to a passing network problem.
+ */
+function isFormatFailure(error) {
+    const stage = error?.gaplessStage;
+    return !(stage === 'fetch' || (stage === 'header' && error instanceof TypeError));
+}
+
+/**
+ * Send gapless engine events to the server log (as an upload_*.log file in
+ * the server's log folder), so failures on TVs can be read without a
+ * remote debugger. Never includes stream URLs: they carry credentials.
+ */
+function reportGaplessEvent(event, details) {
+    const lines = [
+        `[gapless] ${new Date().toISOString()} ${event}`,
+        `userAgent: ${navigator.userAgent}`,
+        `mse flac-in-mp4 supported: ${GaplessEngine.isSupported()}`
+    ];
+    for (const [key, value] of Object.entries(details || {})) {
+        lines.push(`${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`);
+    }
+    console.debug(lines.join('\n'));
+    try {
+        const apiClient = ServerConnections.currentApiClient();
+        if (!apiClient) {
+            return;
+        }
+        apiClient.ajax({
+            type: 'POST',
+            url: apiClient.getUrl('ClientLog/Document'),
+            data: lines.join('\n'),
+            contentType: 'text/plain'
+        }).catch((err) => console.debug('[gapless] could not upload diagnostic log', err));
+    } catch (err) {
+        console.debug('[gapless] could not upload diagnostic log', err);
+    }
+}
+
+function describeError(error) {
+    if (!error) {
+        return 'unknown';
+    }
+    return `${error.gaplessStage || 'unknown stage'} / ${error.name || 'Error'}: ${error.message || error}`;
 }
 
 function getDefaultProfile() {
@@ -143,8 +215,29 @@ class HtmlAudioPlayer {
         function isGaplessEligible(options) {
             return gaplessEnabled()
                 && options.item?.MediaType === 'Audio'
-                && (options.playMethod === 'DirectPlay' || options.playMethod === 'DirectStream')
-                && GaplessEngine.isEligibleUrl(options.url, options.mediaSource);
+                && isEngineStream(options);
+        }
+
+        /** Direct FLAC in a format that hasn't already failed this session. */
+        function isEngineStream(streamInfo) {
+            return (streamInfo.playMethod === 'DirectPlay' || streamInfo.playMethod === 'DirectStream')
+                && GaplessEngine.isEligibleUrl(streamInfo.url, streamInfo.mediaSource)
+                && !failedGaplessFormats.has(gaplessFormatKey(streamInfo.mediaSource));
+        }
+
+        /** Remember a format the engine can't handle here, and log why. */
+        function noteGaplessFailure(event, error, mediaSource) {
+            const format = gaplessFormatKey(mediaSource);
+            const remembered = isFormatFailure(error);
+            if (remembered) {
+                failedGaplessFormats.add(format);
+            }
+            reportGaplessEvent(event, {
+                format,
+                error: describeError(error),
+                formatDisabledForSession: remembered,
+                engine: self._gaplessEngine ? self._gaplessEngine.describe() : null
+            });
         }
 
         function getGaplessEngine(elem) {
@@ -184,7 +277,19 @@ class HtmlAudioPlayer {
                 streamInfo: null
             };
 
-            return engine.start(options.url, itemInfo).then(function (started) {
+            const startedAt = Date.now();
+            const session = {};
+            self._gaplessSession = session;
+            elem.addEventListener('playing', function () {
+                if (self._gaplessActive && self._gaplessSession === session) {
+                    reportGaplessEvent('engine playing', {
+                        format: gaplessFormatKey(options.mediaSource),
+                        startupMs: Date.now() - startedAt
+                    });
+                }
+            }, { once: true });
+
+            return engine.start(options.url, itemInfo, gaplessHints(options.mediaSource, options.item)).then(function (started) {
                 if (started === false) {
                     // Superseded by a newer play(); that call owns the element
                     console.debug('gapless engine start superseded');
@@ -205,11 +310,16 @@ class HtmlAudioPlayer {
                     }
                     return Promise.reject(e);
                 }).then(function () {
+                    // No 'gaplessqueuenext' here: play() resolves before the
+                    // playback manager moves its queue position to this track,
+                    // so asking now would get this same track back as "next".
+                    // The manager resolves the next track itself once its
+                    // playback-started bookkeeping has run.
                     console.debug('gapless engine activated');
-                    Events.trigger(self, 'gaplessqueuenext');
                 });
-            }).catch(function () {
+            }).catch(function (err) {
                 console.debug('gapless engine start failed, falling back to stock playback');
+                noteGaplessFailure('engine start failed; playing without gapless', err, options.mediaSource);
                 resetGaplessEngine();
                 return setCurrentSrc(elem, options);
             });
@@ -232,31 +342,43 @@ class HtmlAudioPlayer {
 
         function onGaplessEngineError(err) {
             // Never log stream urls here (they carry credentials)
-            console.debug('gapless engine error, falling back to stock error handling');
+            console.debug('gapless engine error, falling back to direct playback');
 
+            const elem = self._mediaElement;
+            const engine = self._gaplessEngine;
+            const current = engine ? engine.current() : null;
+            const options = self._currentPlayOptions;
             const errorCode = err && typeof err.code === 'number' ? err.code : 0;
-
-            resetGaplessEngine();
 
             if (errorCode === 1) {
                 // MEDIA_ERR_ABORTED, e.g. src changed while something was playing
+                resetGaplessEngine();
                 return;
             }
 
-            let type;
-            switch (errorCode) {
-                case 2:
-                    type = MediaError.NETWORK_ERROR;
-                    break;
-                case 4:
-                    type = MediaError.MEDIA_NOT_SUPPORTED;
-                    break;
-                default:
-                    type = MediaError.MEDIA_DECODE_ERROR;
-                    break;
+            noteGaplessFailure('engine error; continuing without gapless', err, options?.mediaSource);
+            const wasPaused = elem ? elem.paused : false;
+            resetGaplessEngine();
+
+            if (!elem || !options?.url) {
+                htmlMediaHelper.onErrorInternal(self, MediaError.MEDIA_DECODE_ERROR);
+                return;
             }
 
-            htmlMediaHelper.onErrorInternal(self, type);
+            // The file itself is fine to direct play (the engine only failed
+            // to feed it through Media Source Extensions), so continue it in
+            // the normal player at the same position. The generic error path
+            // would make the playback manager retry with a server transcode.
+            const position = current ? current.position : 0;
+            setCurrentSrc(elem, Object.assign({}, options, {
+                playerStartPositionTicks: Math.round(position * 10000000)
+            })).then(function () {
+                if (wasPaused) {
+                    elem.pause();
+                }
+            }).catch(function () {
+                htmlMediaHelper.onErrorInternal(self, MediaError.MEDIA_DECODE_ERROR);
+            });
         }
 
         self.setNextGaplessTrack = function (streamInfo, item, playlistItemId) {
@@ -268,12 +390,14 @@ class HtmlAudioPlayer {
             // No next track (queue end), or a next track the engine cannot
             // play (mixed queue): complete the timeline so 'ended' fires at
             // the boundary and stock playback takes over.
-            if (!streamInfo || !GaplessEngine.isEligibleUrl(streamInfo.url, streamInfo.mediaSource)) {
+            if (!streamInfo || !isEngineStream(streamInfo)) {
                 engine.markQueueEnd();
                 return;
             }
 
-            engine.appendNext(streamInfo.url, { playlistItemId, item, streamInfo }).catch(function () {
+            const hints = gaplessHints(streamInfo.mediaSource, item);
+            engine.appendNext(streamInfo.url, { playlistItemId, item, streamInfo }, hints).catch(function (err) {
+                noteGaplessFailure('next track could not be prepared; it will play without gapless', err, streamInfo.mediaSource);
                 // Could not append the next track; end the timeline so the
                 // current track still finishes with a normal 'ended'.
                 engine.markQueueEnd();
